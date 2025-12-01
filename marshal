@@ -1,0 +1,191 @@
+// marshal.go — MARSHAL v1.0 "CHAIN PHANTOM" — DERO On-Chain Comms
+// Run: go run marshal.go <your-dero-private-key-hex>
+package main
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
+	"log"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/disintegration/imaging"
+	"github.com/google/uuid"
+	"github.com/deroproject/derohe/crypto"
+	"github.com/deroproject/derohe/rpc"
+	"github.com/lucasb-eyer/go-colorful"
+	"github.com/muesli/termenv"
+)
+
+const CHUNK = 256 * 1024
+const DERO_RPC = "http://127.0.0.1:10100/json_rpc"
+
+var (
+	out = termenv.DefaultOutput()
+	mu  sync.Mutex
+	tr  = make(map[string]*Transfer)
+	wallet *crypto.KeyPair
+	addr   string
+)
+
+type Transfer struct{ ID string; Done, Total int64; Name string; Bar *Bar }
+type Bar struct{ id, name string; total, done int64; t time.Time }
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run marshal.go <dero-private-key-hex>")
+		return
+	}
+	privHex := os.Args[1]
+	privBytes, _ := hex.DecodeString(privHex)
+	wallet = crypto.KeyPairFromBytes(privBytes)
+	addr = wallet.Address().String()
+
+	fmt.Printf("%s MARSHAL ON-CHAIN %s\n%s %s\n",
+		out.String("M").Bold().Foreground(out.Color("#ff0044")),
+		out.String("v1.0").Foreground(out.Color("#00ffff")),
+		out.String("WALLET:").Foreground(out.Color("#aaff00")),
+		out.String(addr).Bold())
+
+	go pollInbox()
+
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		in := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(in, "/file ") {
+			sendFile(strings.TrimPrefix(in, "/file "))
+		} else if strings.HasPrefix(in, "/to ") {
+			parts := strings.Fields(in)
+			if len(parts) >= 3 {
+				to := parts[1]
+				msg := strings.Join(parts[2:], " ")
+				sendMessage(to, msg)
+			}
+		} else if in != "" {
+			fmt.Println("Commands: /to <addr> <msg>  |  /file <path>")
+		}
+	}
+}
+
+func sendMessage(to, msg string) {
+	payload := encrypt([]byte(msg))
+	sendTx(to, payload)
+	fmt.Printf("%s SENT → %s\n", out.String("MSG").Foreground(out.Color("#00ffff")), to[:12])
+}
+
+func sendFile(path string) {
+	f, _ := os.Open(path); defer f.Close()
+	info, _ := f.Stat()
+	id := uuid.New().String()
+	bar := NewBar(id, path, info.Size)
+	tr[id] = &Transfer{ID: id, Total: info.Size, Name: info.Name(), Bar: bar}
+
+	// Send file offer
+	offer := map[string]any{"type": "file", "id": id, "name": info.Name(), "size": info.Size()}
+	sendTx("", encrypt(jsonMarshal(offer)))
+
+	// Send chunks
+	buf := make([]byte, CHUNK)
+	for i := 0; ; i++ {
+		n, err := f.Read(buf)
+		if n > 0 {
+			chunk := map[string]any{"type": "chunk", "id": id, "i": i, "data": hex.EncodeToString(buf[:n])}
+			sendTx("", encrypt(jsonMarshal(chunk)))
+			tr[id].Done += int64(n)
+			bar.Update(tr[id].Done)
+		}
+		if err == io.EOF { break }
+	}
+}
+
+func encrypt(data []byte) []byte {
+	enc, _ := crypto.ElGamalEncrypt(data, nil) // Real version: use recipient pubkey
+	return enc
+}
+
+func sendTx(to string, payload []byte) {
+	client := rpc.NewClient(DERO_RPC)
+	tx := map[string]any{
+		"destination": to,
+		"amount":      0,
+		"payload_rpc": []map[string]any{{"name": "C", "datatype": "S", "value": hex.EncodeToString(payload)}},
+	}
+	var result string
+	client.Call("transfer", tx, &result)
+}
+
+func pollInbox() {
+	t := time.NewTicker(15 * time.Second)
+	for range t.C {
+		client := rpc.NewClient(DERO_RPC)
+		var result struct{ Entries []struct{ Sender, PayloadRPC string } }
+		client.Call("GetTransfers", map[string]any{"in": true}, &result)
+
+		for _, e := range result.Entries {
+			if e.PayloadRPC != "" {
+				data, _ := hex.DecodeString(e.PayloadRPC)
+				decrypted, _ := crypto.ElGamalDecrypt(data, wallet.PrivateKey)
+				handlePayload(e.Sender, decrypted)
+			}
+		}
+	}
+}
+
+func handlePayload(from string, data []byte) {
+	var m map[string]any
+	if json.Unmarshal(data, &m) != nil {
+		fmt.Printf("\n%s %s\n> ", out.String("MSG").Foreground(out.Color("#00ffff")), string(data))
+		return
+	}
+	if m["type"] == "file" {
+		fmt.Printf("\n%s FILE FROM %s: %s\n", out.String("FILE").Foreground(out.Color("#aaff00")), from[:12], m["name"])
+	}
+}
+
+func jsonMarshal(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+func NewBar(id, name string, total int64) *Bar {
+	b := &Bar{id: id[:8], name: filepath.Base(name), total: total, t: time.Now()}
+	go func() {
+		for range time.NewTicker(100 * time.Millisecond).C {
+			mu.Lock()
+			p := float64(b.done) / float64(b.total)
+			f := int(p * 50)
+			bar := strings.Repeat("█", f) + strings.Repeat("░", 50-f)
+			elapsed := time.Since(b.t).Seconds()
+			speed := float64(b.done) / elapsed / 1024 / 1024
+			for i := 0; i < 50; i++ {
+				h := float64(i)/50*360 + float64(time.Now().UnixMilli()%1000)/1000*60
+				c := colorful.Hsv(h, 1, 1)
+				bar = strings.Replace(bar, "█", out.String("█").Foreground(termenv.RGBColor(c)).String(), 1)
+			}
+			fmt.Fprintf(os.Stderr, "\r%s [%s] %s %.1f%% • %.2f MB/s • %s",
+				out.String(">").Foreground(out.Color("#ff0044")),
+				out.String(b.id).Foreground(out.Color("#00ffff")),
+				bar, p*100, speed,
+				out.String(b.name).Foreground(out.Color("#aaff00")))
+			if b.done >= b.total {
+				fmt.Fprintf(os.Stderr, " %s LOCKED\n", out.String("COMPLETE").Bold().Foreground(out.Color("#00ff41")))
+				mu.Unlock()
+				return
+			}
+			mu.Unlock()
+		}
+	}()
+	return b
+}
+
+func (b *Bar) Update(n int64) { b.done = n }
